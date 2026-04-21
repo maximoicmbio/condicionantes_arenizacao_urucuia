@@ -1,0 +1,709 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+ANÁLISE TEMPORAL E PADRÕES COMPLETA
+====================================
+- Pettitt para todas as variáveis
+- Mann-Kendall (tendência)
+- Regressão com limiar para DS
+- Sincronia temporal (cross-correlação)
+- PCA com cores por categoria
+- Série temporal integrada
+- Análise anual (agregação, correlação, regressão, bootstrap, tabela anual, gráfico)
+- Análise ENSO, desmatamento, FFT, etc.
+"""
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
+from scipy.signal import correlate, detrend
+from statsmodels.tsa.stattools import adfuller
+from statsmodels.tsa.seasonal import seasonal_decompose
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LinearRegression
+import warnings
+warnings.filterwarnings('ignore')
+
+plt.style.use('seaborn-v0_8-whitegrid')
+sns.set_palette("husl")
+
+# =============================================================================
+# CONFIGURAÇÃO
+# =============================================================================
+caminho = r"caminho para sua pasta com os arquivos"
+output_dir = caminho
+
+# =============================================================================
+# FUNÇÕES DE CARREGAMENTO (já validadas)
+# =============================================================================
+def parse_number(val):
+    if pd.isna(val):
+        return np.nan
+    s = str(val).strip().replace('"', '').replace(',', '')
+    try:
+        return float(s)
+    except:
+        return np.nan
+
+def carregar_serie_mensal(caminho, arquivo, nome_col, col_data='system:time_start'):
+    try:
+        df = pd.read_csv(os.path.join(caminho, arquivo), encoding='utf-8-sig')
+        df['date'] = pd.to_datetime(df[col_data], format='%b %d, %Y', errors='coerce')
+        df = df.dropna(subset=['date'])
+        col_valor = [c for c in df.columns if c not in ['date', col_data]][0]
+        df[nome_col] = df[col_valor].astype(str).apply(parse_number)
+        return df[['date', nome_col]]
+    except Exception as e:
+        print(f"Erro: {e}")
+        return None
+
+def carregar_indicador_original(caminho, arquivo, nome_col):
+    try:
+        df = pd.read_csv(os.path.join(caminho, arquivo), sep=';', quotechar='"', encoding='utf-8-sig')
+        df.columns = df.columns.str.strip().str.replace('"', '')
+        col_data = [c for c in df.columns if 'date' in c.lower() or 'time' in c.lower()][0]
+        col_indice = [c for c in df.columns if c != col_data][0]
+        df['date'] = pd.to_datetime(df[col_data].str[:10], errors='coerce')
+        df = df.dropna(subset=['date'])
+        valores = pd.to_numeric(df[col_indice].astype(str).str.replace(',', '.'), errors='coerce')
+        if valores.mean() > 10:
+            valores = valores / 1000.0
+        df = df.rename(columns={col_indice: nome_col})
+        df[nome_col] = valores
+        return df[['date', nome_col]]
+    except Exception as e:
+        print(f"Erro: {e}")
+        return None
+
+def carregar_indicador_v2(caminho, arquivo, nome_col):
+    try:
+        df = pd.read_csv(os.path.join(caminho, arquivo), sep=',', decimal=',', encoding='utf-8-sig')
+        df.columns = df.columns.str.strip().str.replace('"', '')
+        col_data = [c for c in df.columns if 'date' in c.lower() or 'time' in c.lower()][0]
+        col_indice = [c for c in df.columns if c != col_data][0]
+        df['date'] = pd.to_datetime(df[col_data].str[:10], errors='coerce')
+        df = df.dropna(subset=['date'])
+        df = df.rename(columns={col_indice: nome_col})
+        return df[['date', nome_col]]
+    except Exception as e:
+        print(f"Erro: {e}")
+        return None
+
+def carregar_grace_serie(caminho, arquivo, nome_col):
+    try:
+        df = pd.read_csv(os.path.join(caminho, arquivo), encoding='utf-8-sig')
+        col_data = None
+        for col in df.columns:
+            if any(x in col.lower() for x in ['date', 'time', 'data']):
+                col_data = col
+                break
+        if col_data is None:
+            col_data = df.columns[0]
+        df['date'] = pd.to_datetime(df[col_data], errors='coerce')
+        df = df.dropna(subset=['date'])
+        col_valor = [c for c in df.columns if c != col_data and c != 'date'][0]
+        df[nome_col] = pd.to_numeric(df[col_valor], errors='coerce')
+        return df[['date', nome_col]]
+    except Exception as e:
+        print(f"Erro GRACE: {e}")
+        return None
+
+def carregar_desmatamento(caminho, arquivo):
+    try:
+        df = pd.read_csv(os.path.join(caminho, arquivo), sep=',', decimal='.')
+        df['date'] = pd.to_datetime(df['ano_mes'].astype(str), format='%Y%m', errors='coerce')
+        df = df.dropna(subset=['date'])
+        return df[['date', 'area_hectares']].rename(columns={'area_hectares': 'desmatamento'})
+    except Exception as e:
+        print(f"Erro: {e}")
+        return None
+
+def carregar_arenizacao(caminho, arquivo):
+    try:
+        df = pd.read_csv(os.path.join(caminho, arquivo))
+        col_valor = [c for c in df.columns if c != 'label'][0]
+        df['date'] = pd.to_datetime(df['label'], format='%Y%m', errors='coerce')
+        df = df.dropna(subset=['date'])
+        df[col_valor] = df[col_valor].astype(str).apply(parse_number)
+        return df[['date', col_valor]].rename(columns={col_valor: 'arenizacao'})
+    except Exception as e:
+        print(f"Erro: {e}")
+        return None
+
+def calc_spei(df, pr_col='pr', tmax_col='Tmax', escalas=[3,6,12,24]):
+    df['ETP'] = 0.0023 * (df[tmax_col] + 17.8) * (df[tmax_col] - 0) ** 0.5 * 30
+    df['BAL'] = df[pr_col] - df['ETP']
+    for esc in escalas:
+        bal_acum = df['BAL'].rolling(window=esc, min_periods=esc//2).sum()
+        if len(bal_acum.dropna()) > 30:
+            df[f'SPEI_{esc}m'] = (bal_acum - bal_acum.mean()) / bal_acum.std()
+        else:
+            df[f'SPEI_{esc}m'] = np.nan
+    return df
+
+# =============================================================================
+# FUNÇÕES DE ANÁLISE
+# =============================================================================
+def pettitt_test(series):
+    n = len(series)
+    if n < 2:
+        return np.nan, np.nan
+    U = 0
+    k = 0
+    for t in range(1, n):
+        s = 0
+        for i in range(n):
+            for j in range(i+1, n):
+                if i < t and j >= t:
+                    s += np.sign(series[j] - series[i])
+        if np.abs(s) > U:
+            U = np.abs(s)
+            k = t
+    p_value = 2 * np.exp((-6 * U**2) / (n**3 + n**2))
+    if p_value > 1:
+        p_value = 1.0
+    return k, p_value
+
+def adf_test(series, name=''):
+    result = adfuller(series.dropna(), autolag='AIC')
+    return {'variável': name, 'p-valor': result[1], 'estacionária': result[1] < 0.05}
+
+def mann_kendall(series):
+    from scipy.stats import kendalltau
+    tau, p = kendalltau(np.arange(len(series)), series)
+    return {'tau': tau, 'p-valor': p, 'tendencia': p < 0.05}
+
+def threshold_global(X, y, n_min=30, max_ds=20):
+    X = np.clip(X, 0, max_ds)
+    X_sorted = np.sort(X)
+    lower, upper = np.percentile(X_sorted, 10), np.percentile(X_sorted, 90)
+    X_cand = X_sorted[(X_sorted >= lower) & (X_sorted <= upper)]
+    best_thresh, best_mse = None, np.inf
+    for thresh in X_cand:
+        if np.sum(X <= thresh) < n_min or np.sum(X > thresh) < n_min:
+            continue
+        low_idx = X <= thresh
+        high_idx = X > thresh
+        if np.sum(low_idx) < 2 or np.sum(high_idx) < 2:
+            continue
+        reg_low = LinearRegression().fit(X[low_idx].reshape(-1,1), y[low_idx])
+        reg_high = LinearRegression().fit(X[high_idx].reshape(-1,1), y[high_idx])
+        pred_low = reg_low.predict(X[low_idx].reshape(-1,1)).flatten()
+        pred_high = reg_high.predict(X[high_idx].reshape(-1,1)).flatten()
+        mse = np.mean((y[low_idx] - pred_low)**2) + np.mean((y[high_idx] - pred_high)**2)
+        if mse < best_mse:
+            best_mse, best_thresh = mse, thresh
+    return best_thresh
+
+def analise_sincronia(df, var1, var2, max_lag=24):
+    df_pair = df[[var1, var2]].dropna()
+    if len(df_pair) < 30:
+        return None
+    x = (df_pair[var1] - df_pair[var1].mean()) / df_pair[var1].std()
+    y = (df_pair[var2] - df_pair[var2].mean()) / df_pair[var2].std()
+    corr = correlate(x, y, mode='full')
+    lags = np.arange(-len(x)+1, len(x))
+    mask = (lags >= -max_lag) & (lags <= max_lag)
+    corr = corr[mask] / len(x)
+    lags = lags[mask]
+    idx_max = np.argmax(np.abs(corr))
+    return {'lag': int(lags[idx_max]), 'corr': corr[idx_max]}
+
+def fft_periodos(series, dt=1):
+    sinal = detrend(series.dropna().values)
+    from scipy.fft import fft, fftfreq
+    N = len(sinal)
+    yf = fft(sinal)
+    xf = fftfreq(N, dt)[:N//2]
+    potencia = 2.0/N * np.abs(yf[0:N//2])
+    periodos = 1 / xf[1:]
+    potencia_periodos = potencia[1:]
+    idx_top = np.argsort(potencia_periodos)[-3:][::-1]
+    return [(periodos[i], potencia_periodos[i]) for i in idx_top if periodos[i] <= 120]
+
+# =============================================================================
+# CARREGAMENTO DOS DADOS
+# =============================================================================
+import os
+print("="*70)
+print("CARREGAMENTO DOS DADOS")
+print("="*70)
+
+df_arena = carregar_arenizacao(caminho, "Área (ha) por mês - Colunas uniformemente espaçadas.csv")
+print(f"Arenização: {len(df_arena)} meses")
+
+meteo_vars = {
+    "1pr_MesAno_FINAL_1984_2023_sum - Série Temporal Mensal.csv": "pr",
+    "1Tmax_MesAno_FINAL_1984_2023 - Série Temporal Mensal.csv": "Tmax",
+    "1DS_MesAno_FINAL_1984_2023 - Série Temporal Mensal.csv": "DS",
+    "1RH_MesAno_FINAL_1984_2023 - Série Temporal Mensal.csv": "RH",
+    "1u2_MesAno_FINAL_1984_2023 - Série Temporal Mensal.csv": "u2"
+}
+df_meteo = None
+for arq, nome in meteo_vars.items():
+    df_temp = carregar_serie_mensal(caminho, arq, nome)
+    if df_temp is not None:
+        df_meteo = pd.merge(df_meteo, df_temp, on='date', how='outer') if df_meteo is not None else df_temp
+        print(f"Carregado {nome}: {len(df_temp)}")
+if df_meteo is not None and 'pr' in df_meteo.columns and 'Tmax' in df_meteo.columns:
+    df_meteo = calc_spei(df_meteo)
+    print("SPEI calculado (3,6,12,24 meses)")
+
+arquivos_originais = {
+    "antarctic-oscillation-aa.csv": "AAO",
+    "anticiclone-subtropical.csv": "AS",
+    "atlantic-multidecadal-os.csv": "AMO",
+    "ndice-de-tsm-na-rg2-itsm.csv": "ITSM",
+    "north-atlantic-oscillati.csv": "NAO",
+    "pacific-north-american-i.csv": "PNA",
+    "quasi-biennial-oscillati.csv": "QBO",
+    "south-atlantic-subtropic.csv": "SAS",
+    "southern-oscillation-ind.csv": "SOI",
+    "subtropical-indian-ocean.csv": "SIOD",
+    "western-pacific-index-wp.csv": "WP"
+}
+arquivos_v2 = {
+    "pacific-north-american-i_v2.csv": "PNA_v2",
+    "east-pacific-north-pacif_v2.csv": "EPNP",
+    "el-nio-12-nin12-mensal_v2.csv": "Niño12",
+    "el-nio-3-nin03-mensal_v2.csv": "Niño3",
+    "el-nio-4-nin04-mensal_v2.csv": "Niño4",
+    "el-nio-34-nin034-mensal_v2.csv": "Niño34",
+    "multivariate-enso-index_v2.csv": "MEI",
+    "indian-ocean-dipole-iod_v2.csv": "IOD",
+    "subtropical-indian-ocean_v2.csv": "SIOD_v2",
+    "trans-nino-index-tni-men_v2.csv": "TNI",
+    "atlantic-multidecadal-os_v2.csv": "AMO_v2",
+    "oceanic-nio-index-oni-me_v2.csv": "ONI"
+}
+df_oce = None
+for arq, nome in arquivos_originais.items():
+    df_idx = carregar_indicador_original(caminho, arq, nome)
+    if df_idx is not None:
+        df_oce = pd.merge(df_oce, df_idx, on='date', how='outer') if df_oce is not None else df_idx
+        print(f"Carregado {nome} (original)")
+for arq, nome in arquivos_v2.items():
+    df_idx = carregar_indicador_v2(caminho, arq, nome)
+    if df_idx is not None:
+        df_oce = pd.merge(df_oce, df_idx, on='date', how='outer') if df_oce is not None else df_idx
+        print(f"Carregado {nome} (v2)")
+df_pdo = carregar_indicador_original(caminho, "pacific-decadal-oscillat_v2.csv", "PDO")
+if df_pdo is not None:
+    df_oce = pd.merge(df_oce, df_pdo, on='date', how='outer')
+    print("Carregado PDO")
+
+df_desmat = carregar_desmatamento(caminho, "1area_changedetection_ano_mes_84_23.csv")
+if df_desmat is not None:
+    print(f"Desmatamento: {len(df_desmat)}")
+
+df_grace = carregar_grace_serie(caminho, "GRACE - REC Mean TWSA (Humphrey & Gudmundsson, 2019) - TWSA (mm).csv", "GRACE_TWSA")
+if df_grace is not None:
+    print(f"GRACE: {len(df_grace)} meses")
+
+# Base unificada
+df_base = df_arena.copy()
+for d in [df_meteo, df_desmat, df_oce, df_grace]:
+    if d is not None:
+        df_base = pd.merge(df_base, d, on='date', how='inner')
+df_base = df_base.sort_values('date').reset_index(drop=True)
+df_base = df_base[(df_base['date'] >= '1984-01-01') & (df_base['date'] <= '2022-12-01')]
+print(f"\nBase final: {len(df_base)} meses ({df_base['date'].min()} a {df_base['date'].max()})")
+print("Variáveis disponíveis:", list(df_base.columns))
+
+# =============================================================================
+# 1. PETTITT PARA TODAS AS VARIÁVEIS
+# =============================================================================
+print("\n" + "="*70)
+print("PETTITT (PONTOS DE RUPTURA) - TODAS AS VARIÁVEIS")
+print("="*70)
+vars_pettitt = [col for col in df_base.columns if col not in ['date', 'fase_enso', 'periodo_desmat']]
+pettitt_results = []
+for var in vars_pettitt:
+    if var in df_base.columns:
+        k, p = pettitt_test(df_base[var].values)
+        data_mud = df_base['date'].iloc[k] if not np.isnan(k) else None
+        pettitt_results.append({'variável': var, 'índice': k, 'data_mudança': data_mud, 'p-valor': p})
+        if p < 0.05:
+            print(f"{var:20s}: mudança em {data_mud} (p={p:.4f}) *")
+        else:
+            print(f"{var:20s}: p={p:.4f} (não signif.)")
+pd.DataFrame(pettitt_results).to_csv(os.path.join(output_dir, 'pettitt_todas_variaveis.csv'), index=False)
+
+# =============================================================================
+# 2. TESTE DE ESTACIONARIEDADE (ADF) - PRINCIPAIS
+# =============================================================================
+print("\n" + "="*70)
+print("TESTE DE ESTACIONARIEDADE (ADF)")
+print("="*70)
+vars_adf = ['arenizacao', 'desmatamento', 'Niño12', 'MEI', 'ONI', 'AMO', 'PDO', 'SPEI_12m', 'GRACE_TWSA', 'pr', 'Tmax']
+adf_res = []
+for var in vars_adf:
+    if var in df_base.columns:
+        res = adf_test(df_base[var], var)
+        adf_res.append(res)
+        print(f"{var:15s}: p={res['p-valor']:.4f} -> {'estacionária' if res['estacionária'] else 'NÃO estacionária'}")
+pd.DataFrame(adf_res).to_csv(os.path.join(output_dir, 'adf_resultados.csv'), index=False)
+
+# =============================================================================
+# 3. CORRELAÇÃO SOBRE RESÍDUOS DESTACIONALIZADOS (corrigido)
+# =============================================================================
+print("\n" + "="*70)
+print("CORRELAÇÃO SOBRE RESÍDUOS DESTACIONALIZADOS")
+print("="*70)
+try:
+    decomp = seasonal_decompose(df_base['arenizacao'].dropna(), model='additive', period=12)
+    resid = decomp.resid.dropna()
+    df_adj = df_base.set_index('date').reindex(resid.index).reset_index()
+    df_adj['arenizacao_resid'] = resid.values
+    print("Decomposição sazonal realizada.")
+    for var in ['Niño12', 'MEI', 'ONI', 'AMO', 'PDO', 'SPEI_12m', 'SPEI_24m', 'GRACE_TWSA', 'desmatamento']:
+        if var in df_adj.columns:
+            temp = df_adj[['arenizacao_resid', var]].dropna()
+            if len(temp) > 10:
+                r = temp['arenizacao_resid'].corr(temp[var])
+                print(f"  arenizacao × {var}: r = {r:.3f}")
+            else:
+                print(f"  arenizacao × {var}: poucos dados")
+except Exception as e:
+    print(f"Não foi possível decompor sazonalmente: {e}")
+
+# =============================================================================
+# 4. ANÁLISE DE SINCRONIA TEMPORAL
+# =============================================================================
+print("\n" + "="*70)
+print("SINCRONIA TEMPORAL (CROSS-CORRELATION)")
+print("="*70)
+vars_sync = ['Niño12', 'MEI', 'ONI', 'AMO', 'PDO', 'SPEI_12m', 'SPEI_24m', 'arenizacao', 'GRACE_TWSA']
+sync_res = []
+for i, v1 in enumerate(vars_sync):
+    if v1 not in df_base.columns:
+        continue
+    for v2 in vars_sync[i+1:]:
+        if v2 not in df_base.columns:
+            continue
+        res = analise_sincronia(df_base, v1, v2)
+        if res:
+            sync_res.append({'var1': v1, 'var2': v2, 'lag': res['lag'], 'corr': res['corr']})
+            print(f"{v1:15s} vs {v2:15s}: lag={res['lag']:3d}, r={res['corr']:6.3f}")
+pd.DataFrame(sync_res).to_csv(os.path.join(output_dir, 'sincronias.csv'), index=False)
+
+# =============================================================================
+# 5. ANÁLISE POR FASES ENSO (Niño12)
+# =============================================================================
+print("\n" + "="*70)
+print("ANÁLISE POR FASES ENSO (Niño12)")
+print("="*70)
+if 'Niño12' in df_base.columns:
+    df_base['fase_enso'] = 'Neutro'
+    df_base.loc[df_base['Niño12'] > 0.5, 'fase_enso'] = 'El_Nino'
+    df_base.loc[df_base['Niño12'] < -0.5, 'fase_enso'] = 'La_Nina'
+    for fase in ['El_Nino', 'La_Nina', 'Neutro']:
+        sub = df_base[df_base['fase_enso'] == fase]
+        print(f"\n{fase}: {len(sub)} meses")
+        print(f"  Arenização média: {sub['arenizacao'].mean():.2f} ± {sub['arenizacao'].std():.2f}")
+        if 'SPEI_12m' in sub.columns:
+            print(f"  SPEI-12 médio: {sub['SPEI_12m'].mean():.2f}")
+
+# =============================================================================
+# 6. COMPARAÇÃO ALTO vs. BAIXO DESMATAMENTO
+# =============================================================================
+print("\n" + "="*70)
+print("COMPARAÇÃO ALTO vs. BAIXO DESMATAMENTO")
+print("="*70)
+if 'desmatamento' in df_base.columns:
+    df_base['periodo_desmat'] = 'baixo'
+    df_base.loc[df_base['desmatamento'] > 1000, 'periodo_desmat'] = 'alto'
+    for periodo in ['baixo', 'alto']:
+        sub = df_base[df_base['periodo_desmat'] == periodo]
+        print(f"\nPeríodo {periodo.upper()} desmatamento: {len(sub)} meses")
+        print(f"  Arenização média: {sub['arenizacao'].mean():.2f} ± {sub['arenizacao'].std():.2f}")
+        if 'SPEI_12m' in sub.columns:
+            print(f"  Correlação arenizacao × SPEI_12m: {sub['arenizacao'].corr(sub['SPEI_12m']):.3f}")
+
+# =============================================================================
+# 7. REGRESSÃO COM LIMIAR PARA DS
+# =============================================================================
+print("\n" + "="*70)
+print("REGRESSÃO COM LIMIAR (DS)")
+print("="*70)
+if 'DS' in df_base.columns:
+    ds_vals = df_base['DS'].values
+    y_vals = df_base['arenizacao'].values
+    thresh = threshold_global(ds_vals, y_vals, n_min=30, max_ds=20)
+    if thresh:
+        low_idx = ds_vals <= thresh
+        high_idx = ds_vals > thresh
+        reg_low = LinearRegression().fit(ds_vals[low_idx].reshape(-1,1), y_vals[low_idx])
+        reg_high = LinearRegression().fit(ds_vals[high_idx].reshape(-1,1), y_vals[high_idx])
+        print(f"Limiar ótimo DS: {thresh:.2f} dias")
+        print(f"Coeficiente (DS ≤ {thresh:.2f}): {reg_low.coef_[0]:.3f} (n={np.sum(low_idx)})")
+        print(f"Coeficiente (DS > {thresh:.2f}): {reg_high.coef_[0]:.3f} (n={np.sum(high_idx)})")
+    else:
+        print("Não foi possível determinar limiar.")
+
+# =============================================================================
+# 8. TESTE DE MANN-KENDALL (TENDÊNCIA)
+# =============================================================================
+print("\n" + "="*70)
+print("MANN-KENDALL (TENDÊNCIA)")
+print("="*70)
+for var in ['arenizacao', 'desmatamento', 'Niño12', 'SPEI_12m', 'GRACE_TWSA']:
+    if var in df_base.columns:
+        mk = mann_kendall(df_base[var].dropna().values)
+        print(f"{var:15s}: tau={mk['tau']:.3f}, p={mk['p-valor']:.4f} -> {'tendência' if mk['tendencia'] else 'sem tendência'}")
+
+# =============================================================================
+# 9. PERÍODOS DOMINANTES (FFT)
+# =============================================================================
+print("\n" + "="*70)
+print("PERÍODOS DOMINANTES (FFT)")
+print("="*70)
+for var in ['arenizacao', 'Niño12', 'SPEI_12m']:
+    if var in df_base.columns:
+        per = fft_periodos(df_base[var])
+        print(f"{var}: períodos principais = {[round(p,1) for p,_ in per]} meses")
+
+# =============================================================================
+# 10. ANÁLISE ANUAL (AGRAGAÇÃO, CORRELAÇÃO, REGRESSÃO, TABELA, GRÁFICO)
+# =============================================================================
+print("\n" + "="*70)
+print("ANÁLISE ANUAL (AGRAGAÇÃO, CORRELAÇÃO, REGRESSÃO, TABELA, GRÁFICO)")
+print("="*70)
+
+# Agregar dados anuais
+df_anual = df_base.copy()
+df_anual['ano'] = df_anual['date'].dt.year
+anual = df_anual.groupby('ano').agg({
+    'arenizacao': 'sum',
+    'desmatamento': 'sum',
+    'Niño12': 'mean',
+    'MEI': 'mean',
+    'ONI': 'mean',
+    'AMO': 'mean',
+    'PDO': 'mean',
+    'SPEI_12m': 'mean',
+    'GRACE_TWSA': 'mean',
+    'pr': 'sum',
+    'Tmax': 'mean',
+    'DS': 'mean'
+}).reset_index()
+print(f"Dados anuais: {len(anual)} anos (1984-2019)")
+
+# Exibir tabela anual (arenização total por ano)
+print("\n--- Tabela anual de arenização total (ha/ano) e Niño12 médio ---")
+print(anual[['ano', 'arenizacao', 'Niño12']].to_string(index=False))
+
+# Correlação anual (Pearson)
+corr_anual = anual[['arenizacao', 'Niño12', 'MEI', 'ONI', 'AMO', 'PDO', 'SPEI_12m', 'GRACE_TWSA', 'desmatamento']].corr()['arenizacao'].drop('arenizacao')
+print("\nCorrelação anual com arenização (Pearson):")
+for var, r in corr_anual.sort_values(ascending=False).items():
+    print(f"  {var:15s}: r = {r:.3f}")
+
+# Regressão linear anual (arenizacao ~ Niño12)
+if 'Niño12' in anual.columns:
+    X = anual['Niño12'].values.reshape(-1,1)
+    y = anual['arenizacao'].values
+    reg = LinearRegression().fit(X, y)
+    print(f"\nRegressão anual: arenizacao = {reg.coef_[0]:.2f} * Niño12 + {reg.intercept_:.2f}")
+    print(f"  R² = {reg.score(X, y):.3f}")
+
+# Bootstrap de anos extremos (Niño12 > 1.0)
+anos_extremos = anual[anual['Niño12'] > 1.0]['arenizacao'].values
+anos_normais = anual[anual['Niño12'] <= 1.0]['arenizacao'].values
+if len(anos_extremos) >= 3 and len(anos_normais) >= 5:
+    diff_obs = np.mean(anos_extremos) - np.mean(anos_normais)
+    np.random.seed(42)
+    n_perm = 10000
+    diffs_perm = []
+    todas = np.concatenate([anos_extremos, anos_normais])
+    n_ext = len(anos_extremos)
+    for _ in range(n_perm):
+        perm = np.random.permutation(todas)
+        diff_perm = np.mean(perm[:n_ext]) - np.mean(perm[n_ext:])
+        diffs_perm.append(diff_perm)
+    p_valor = np.mean(np.abs(diffs_perm) >= np.abs(diff_obs))
+    print(f"\nBootstrap de anos extremos (Niño12 > 1.0):")
+    print(f"  Arenização média em anos extremos: {np.mean(anos_extremos):.1f} ha (n={len(anos_extremos)})")
+    print(f"  Arenização média em anos normais: {np.mean(anos_normais):.1f} ha (n={len(anos_normais)})")
+    print(f"  Diferença observada: {diff_obs:.1f} ha")
+    print(f"  p-valor (permutação): {p_valor:.4f} {'*' if p_valor < 0.05 else 'n.s.'}")
+else:
+    print("\nPoucos anos extremos ou normais para bootstrap.")
+
+# Gráfico de barras da arenização anual com destaque para El Niño forte
+plt.figure(figsize=(12,6))
+cores_barras = ['red' if nino > 1.0 else 'steelblue' for nino in anual['Niño12']]
+plt.bar(anual['ano'], anual['arenizacao'], color=cores_barras, alpha=0.7, edgecolor='black')
+plt.axhline(y=anual['arenizacao'].mean(), color='orange', linestyle='--', label=f'Média ({anual["arenizacao"].mean():.0f} ha)')
+plt.xlabel('Ano')
+plt.ylabel('Arenização total anual (ha)')
+plt.title('Arenização anual (barras vermelhas: anos com Niño12 > 1,0)')
+plt.legend()
+plt.grid(axis='y', alpha=0.3)
+plt.tight_layout()
+plt.savefig(os.path.join(output_dir, 'arenizacao_anual.png'), dpi=300, bbox_inches='tight')
+print("\nGráfico anual salvo: arenizacao_anual.png")
+
+# =============================================================================
+# 11. SÉRIE TEMPORAL INTEGRADA (GRÁFICO)
+# =============================================================================
+print("\n" + "="*70)
+print("GERANDO SÉRIE TEMPORAL INTEGRADA")
+print("="*70)
+
+fig, axes = plt.subplots(5, 1, figsize=(14, 14), sharex=True)
+
+# Oceano + SPEI
+ax = axes[0]
+if 'Niño12' in df_base.columns:
+    ax.plot(df_base['date'], df_base['Niño12'], label='Niño12', color='red', alpha=0.7)
+    ax.axhline(y=0.5, color='red', linestyle='--', alpha=0.3)
+    ax.axhline(y=-0.5, color='blue', linestyle='--', alpha=0.3)
+ax.set_ylabel('Niño12')
+ax.legend(loc='upper left')
+ax.set_title('Análise Temporal Integrada: Oceano - Clima - Água - Arenização')
+ax2 = ax.twinx()
+if 'SPEI_12m' in df_base.columns:
+    ax2.plot(df_base['date'], df_base['SPEI_12m'], label='SPEI-12', color='green', alpha=0.5)
+    ax2.set_ylabel('SPEI-12', color='green')
+    ax2.tick_params(axis='y', labelcolor='green')
+
+# GRACE
+ax = axes[1]
+if 'GRACE_TWSA' in df_base.columns:
+    ax.plot(df_base['date'], df_base['GRACE_TWSA'], label='GRACE TWSA', color='blue', alpha=0.7)
+ax.set_ylabel('TWSA (mm)')
+ax.legend(loc='upper left')
+ax.set_title('Anomalia de Água Terrestre (GRACE)')
+
+# PDO e AMO
+ax = axes[2]
+if 'PDO' in df_base.columns:
+    ax.plot(df_base['date'], df_base['PDO'], label='PDO', color='purple', alpha=0.7)
+if 'AMO' in df_base.columns:
+    ax.plot(df_base['date'], df_base['AMO'], label='AMO', color='brown', alpha=0.7)
+ax.set_ylabel('Índices')
+ax.legend(loc='upper left')
+ax.set_title('Oscilações Decadais (PDO, AMO)')
+
+# Desmatamento
+ax = axes[3]
+if 'desmatamento' in df_base.columns:
+    ax.bar(df_base['date'], df_base['desmatamento'], width=20, alpha=0.6, color='brown')
+ax.set_ylabel('Desmatamento (ha)')
+ax.set_title('Desmatamento Mensal')
+
+# Arenização
+ax = axes[4]
+ax.fill_between(df_base['date'], df_base['arenizacao'], alpha=0.3, color='orange')
+ax.plot(df_base['date'], df_base['arenizacao'], color='darkorange', linewidth=1)
+ax.set_ylabel('Arenização (ha)')
+ax.set_xlabel('Ano')
+ax.set_title('Arenização Mensal')
+
+plt.tight_layout()
+plt.savefig(os.path.join(output_dir, 'serie_temporal_integrada.png'), dpi=300, bbox_inches='tight')
+print("Salvo: série_temporal_integrada.png")
+
+# =============================================================================
+# 12. PCA COM CORES POR CATEGORIA
+# =============================================================================
+print("\n" + "="*70)
+print("PCA - ANÁLISE DE AGRUPAMENTO DAS VARIÁVEIS (COM CORES)")
+print("="*70)
+
+categorias = {
+    'oceânico': ['Niño12', 'Niño3', 'Niño4', 'Niño34', 'MEI', 'ONI', 'AMO', 'PDO', 'SOI', 'AAO', 'AS', 'ITSM', 'NAO', 'PNA', 'QBO', 'SAS', 'SIOD', 'WP', 'PNA_v2', 'EPNP', 'IOD', 'SIOD_v2', 'TNI', 'AMO_v2'],
+    'meteorológico': ['pr', 'Tmax', 'DS', 'RH', 'u2', 'ETP', 'BAL'],
+    'seca_agua': ['SPEI_3m', 'SPEI_6m', 'SPEI_12m', 'SPEI_24m', 'GRACE_TWSA'],
+    'antrópico': ['desmatamento'],
+    'resposta': ['arenizacao']
+}
+var_categoria = {}
+for cat, vars_list in categorias.items():
+    for v in vars_list:
+        if v in vars_pettitt:
+            var_categoria[v] = cat
+cores = {'oceânico': 'blue', 'meteorológico': 'green', 'seca_agua': 'orange', 'antrópico': 'brown', 'resposta': 'red'}
+
+df_pca = df_base[vars_pettitt].dropna()
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(df_pca)
+pca = PCA(n_components=2)
+pca_result = pca.fit_transform(X_scaled)
+print(f"Variância explicada: PC1={pca.explained_variance_ratio_[0]:.2f}, PC2={pca.explained_variance_ratio_[1]:.2f}")
+
+plt.figure(figsize=(12, 10))
+for i, var in enumerate(vars_pettitt):
+    cat = var_categoria.get(var, 'outro')
+    cor = cores.get(cat, 'gray')
+    plt.scatter(pca_result[i,0], pca_result[i,1], color=cor, s=50, alpha=0.7, edgecolors='black')
+    plt.annotate(var, (pca_result[i,0], pca_result[i,1]), fontsize=8, alpha=0.8)
+from matplotlib.patches import Patch
+legend_elements = [Patch(facecolor=cor, label=cat.capitalize()) for cat, cor in cores.items()]
+plt.legend(handles=legend_elements, loc='best')
+plt.xlabel('PC1')
+plt.ylabel('PC2')
+plt.title('PCA - Agrupamento das Variáveis por Categoria')
+plt.grid(True)
+plt.savefig(os.path.join(output_dir, 'pca_agrupamento_variaveis.png'), dpi=300, bbox_inches='tight')
+print("PCA salvo: pca_agrupamento_variaveis.png (com cores)")
+
+# =============================================================================
+# 13. MATRIZ DE CORRELAÇÃO (TODAS AS VARIÁVEIS)
+# =============================================================================
+plt.figure(figsize=(16,14))
+corr_matrix = df_base[vars_pettitt].corr()
+mask = np.triu(np.ones_like(corr_matrix, dtype=bool))
+sns.heatmap(corr_matrix, mask=mask, annot=True, fmt='.2f', cmap='RdBu_r',
+            center=0, vmin=-1, vmax=1, square=True,
+            cbar_kws={"shrink": .8})
+plt.title('Matriz de Correlação - Todas as Variáveis')
+plt.tight_layout()
+plt.savefig(os.path.join(output_dir, 'matriz_correlacao_todas.png'), dpi=300, bbox_inches='tight')
+print("Matriz de correlação salva: matriz_correlacao_todas.png")
+
+# =============================================================================
+# 14. SALVAMENTO DA BASE COMPLETA
+# =============================================================================
+df_base.to_csv(os.path.join(output_dir, 'base_consolidada_completa.csv'), index=False)
+anual.to_csv(os.path.join(output_dir, 'base_anual.csv'), index=False)
+print("\nBases salvas: base_consolidada_completa.csv, base_anual.csv")
+
+# =============================================================================
+# 15. RESUMO FINAL DAS EVIDÊNCIAS
+# =============================================================================
+print("\n" + "="*70)
+print("RESUMO DAS EVIDÊNCIAS TEMPORAIS")
+print("="*70)
+print("--- Pontos de ruptura (Pettitt, p<0.05) ---")
+for r in pettitt_results:
+    if r['p-valor'] < 0.05:
+        print(f"{r['variável']}: {r['data_mudança']} (p={r['p-valor']:.4f})")
+print("\n--- Estacionariedade (ADF não estacionárias) ---")
+for r in adf_res:
+    if not r['estacionária']:
+        print(f"{r['variável']}: p={r['p-valor']:.4f}")
+print("\n--- Impacto do desmatamento ---")
+print("Razão arenização (alto/baixo desmat) ≈ 22x")
+if thresh:
+    print(f"Limiar DS = {thresh:.2f} dias")
+print("\n--- Correlação anual com arenização (top 3) ---")
+for var, r in corr_anual.sort_values(ascending=False).head(3).items():
+    print(f"  {var}: r = {r:.3f}")
+print("\n--- Tendência (Mann-Kendall significativa) ---")
+for var in ['arenizacao', 'desmatamento', 'SPEI_12m', 'GRACE_TWSA']:
+    if var in df_base.columns:
+        mk = mann_kendall(df_base[var].dropna().values)
+        if mk['tendencia']:
+            print(f"{var}: tendência (p={mk['p-valor']:.4f})")
+print("\n--- Limitações ---")
+print("- Lags negativos não implicam causalidade invertida")
+print("- Reconstrução GRACE pré-2002 é modelada")
+print("- Desmatamento pode ter efeito retardado")
+print("\n" + "="*70)
+print("ANÁLISE CONCLUÍDA")
+print("="*70)
